@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="Nostr standalone local client to read notes (WIP)"
+    />
+    <title>Nostr Client</title>
+
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
+    />
+  </head>
+
+  <body>
+    <header>
+      <nav class="container-fluid">
+        <ul>
+          <li><strong>NOSTR Client</strong></li>
+        </ul>
+        <ul>
+          <li>
+            <button
+              class="contrast"
+              data-target="pubkey-modal"
+              onclick="toggleModal(event)"
+              id="add-pubkey"
+            >
+              Add Pubkey
+            </button>
+          </li>
+        </ul>
+      </nav>
+    </header>
+    <main class="container">
+      <section id="notes"></section>
+    </main>
+    <!-- <footer>...</footer> -->
+
+    <dialog id="pubkey-modal">
+      <article>
+        <header>
+          <button
+            aria-label="Close"
+            rel="prev"
+            data-target="pubkey-modal"
+            onclick="toggleModal(event)"
+          ></button>
+          <h3>Add you Public Key</h3>
+        </header>
+        <input
+          type="text"
+          name="pubkey"
+          placeholder="npub..."
+          aria-label="Pubkey"
+        />
+        <footer>
+          <button
+            role="button"
+            class="secondary"
+            data-target="pubkey-modal"
+            onclick="toggleModal(event)"
+          >
+            Cancel</button
+          ><button
+            autofocus
+            data-target="pubkey-modal"
+            onclick="toggleModal(event)"
+          >
+            Confirm
+          </button>
+        </footer>
+      </article>
+    </dialog>
+
+    <script src="https://unpkg.com/nostr-tools/lib/nostr.bundle.js"></script>
+    <!-- <script src="js/index.js"></script> -->
+    <script>
+      const nostr = NostrTools
+      const notesSection = document.getElementById('notes')
+
+      const pool = new nostr.SimplePool()
+      let relays = new Set([
+        'wss://relay.nostr.band/',
+        'wss://nostr-pub.wellorder.net/',
+        'wss://relay.damus.io/'
+      ])
+
+      // timestamp a year ago
+      let aYearAgo = 365 * 24 * 60 * 60
+      let since = parseInt((Date.now() - aYearAgo) / 1000) || 0
+
+      let pk = localStorage.getItem('pk') || null
+      let npub = null
+      let follows = new Set()
+      let ev = new Map()
+      let profiles = new Map()
+
+      if (pk) {
+        pk = sanitizePK(pk)
+        getInitial().then(async () => {
+          await getNotes()
+          subscribeToRelays()
+        })
+      }
+
+      async function getInitial() {
+        console.log('Getting initial')
+        notesSection.ariaBusy = true
+        let events = await pool.querySync([...relays], {
+          kinds: [0, 3, 10002],
+          authors: [pk]
+        })
+        events.forEach(event => {
+          if (event.kind == 0) {
+            profiles.set(event.id, event)
+          }
+          if (event.kind == 3) {
+            event.tags.forEach(tag => {
+              if (tag[0] == ['p']) {
+                follows.add(tag[1])
+              }
+            })
+          }
+          if (event.kind == 10002) {
+            event.tags.forEach(tag => {
+              if (tag[0] == ['r'] && tag[2] != 'write') {
+                relays.add(tag[1])
+              }
+            })
+          }
+        })
+        const _profiles = await pool.querySync([...relays], {
+          kinds: [0],
+          authors: [...follows]
+        })
+        _profiles.forEach(profile => {
+          profiles.set(profile.pubkey, profile)
+        })
+        notesSection.ariaBusy = false
+      }
+
+      function subscribeToRelays() {
+        const events = [...ev.values()] || []
+        const _since =
+          events.sort((a, b) => b.created_at - a.created_at)[0].created_at || 0
+        console.log('Since:', since)
+        pool.subscribeMany(
+          Array.from(relays),
+          [
+            {
+              authors: Array.from(follows),
+              kinds: [1],
+              since: _since
+            }
+          ],
+          {
+            onevent(event) {
+              console.log('Got an event')
+              if (event.kind == 1) {
+                // check if the event is already in the map
+                if (ev.has(event.id)) return
+
+                ev.set(event.id, event)
+                addNote(event)
+              }
+            }
+          }
+        )
+      }
+
+      async function getNotes() {
+        console.log('Getting notes', since)
+        notesSection.ariaBusy = true
+        let events = await pool.querySync([...relays], {
+          kinds: [1],
+          authors: [...follows],
+          since
+        })
+        events
+          .sort((a, b) => b.created_at - a.created_at)
+          .forEach(event => {
+            ev.set(event.id, event)
+          })
+        notesSection.ariaBusy = false
+        renderNotes()
+      }
+
+      function sanitizePK(pk) {
+        if (pk.startsWith('npub')) {
+          npub = pk
+          let {type, data} = nostr.nip19.decode(npub)
+          pk = data
+        } else {
+          npub = nostr.nip19.npubEncode(pk)
+        }
+        follows.add(pk) // follow self
+        return pk
+      }
+
+      function renderNotes() {
+        notesSection.innerHTML = ''
+        ev.forEach(event => {
+          if (event.kind === 1) {
+            notesSection.appendChild(noteTemplate(event))
+          }
+        })
+      }
+
+      function addNote(event) {
+        notesSection.prepend(noteTemplate(event))
+      }
+
+      // Modal
+      const isOpenClass = 'modal-is-open'
+      const openingClass = 'modal-is-opening'
+      const closingClass = 'modal-is-closing'
+      const scrollbarWidthCssVar = '--pico-scrollbar-width'
+      const animationDuration = 400 // ms
+      const inputPK = document.getElementsByName('pubkey')[0]
+      let visibleModal = null
+
+      // Toggle modal
+      const toggleModal = event => {
+        event.preventDefault()
+        const modal = document.getElementById(
+          event.currentTarget.dataset.target
+        )
+        if (!modal) return
+        modal && (modal.open ? closeModal(modal) : openModal(modal))
+      }
+
+      // Open modal
+      const openModal = modal => {
+        const {documentElement: html} = document
+        if (pk) {
+          inputPK.value = pk
+        }
+        const scrollbarWidth = getScrollbarWidth()
+        if (scrollbarWidth) {
+          html.style.setProperty(scrollbarWidthCssVar, `${scrollbarWidth}px`)
+        }
+        html.classList.add(isOpenClass, openingClass)
+        setTimeout(() => {
+          visibleModal = modal
+          html.classList.remove(openingClass)
+        }, animationDuration)
+        modal.showModal()
+      }
+
+      // Close modal
+      const closeModal = modal => {
+        visibleModal = null
+        const {documentElement: html} = document
+        html.classList.add(closingClass)
+        if (inputPK.value !== '') {
+          pk = sanitizePK(inputPK.value)
+          localStorage.setItem('pk', pk)
+          inputPK.value = ''
+        }
+        setTimeout(() => {
+          html.classList.remove(closingClass, isOpenClass)
+          html.style.removeProperty(scrollbarWidthCssVar)
+          modal.close()
+        }, animationDuration)
+        pk &&
+          Promise.resolve(getInitial()).then(async () => {
+            await getNotes()
+            subscribeToRelays()
+          })
+      }
+
+      // Close with a click outside
+      document.addEventListener('click', event => {
+        if (visibleModal === null) return
+        const modalContent = visibleModal.querySelector('article')
+        const isClickInside = modalContent.contains(event.target)
+        !isClickInside && closeModal(visibleModal)
+      })
+
+      // Close with Esc key
+      document.addEventListener('keydown', event => {
+        if (event.key === 'Escape' && visibleModal) {
+          closeModal(visibleModal)
+        }
+      })
+
+      // Get scrollbar width
+      const getScrollbarWidth = () => {
+        const scrollbarWidth =
+          window.innerWidth - document.documentElement.clientWidth
+        return scrollbarWidth
+      }
+
+      // Is scrollbar visible
+      const isScrollbarVisible = () => {
+        return document.body.scrollHeight > screen.height
+      }
+
+      // Templates
+      const getProfile = id => {
+        try {
+          const profile = profiles.get(id)
+          if (!profile) return id
+          console.log('Profile:', profile)
+          const content = JSON.parse(profile?.content)
+          console.log('Content:', content)
+          const name = content?.name || id
+          return name
+        } catch (error) {
+          return id
+        }
+      }
+      const noteTemplate = event => {
+        let note = document.createElement('article')
+        note.whiteSpace = 'preserve'
+        note.innerHTML = `
+          <header>
+            ${getProfile(event.pubkey)}
+          </header>
+            ${event.content}
+          <footer>
+            <time datetime="${event.created_at}">${new Date(
+          event.created_at * 1000
+        ).toLocaleString()}</time>
+            </footer>
+      `
+        return note
+      }
+    </script>
+  </body>
+</html>
